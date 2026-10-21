@@ -5,6 +5,8 @@ exp/ contains the code for the python experiment
 hardware specifications
 - design choice for the agent and load balance. when doing a p-to-p trasnfer, we should probably not have node b also push to its own cpu and store the same hashes in the global router as well i think. because thats just redundant. 
 - also, i think we can compare our system against Hicacjhes existing L3 sharing. Ours shares L2 over netwowrk directly. Hicaches built in system write from L2 into a file (given this is lazily, but i dont think the L1 to L2 can be made lazy. i.e, on demand) and we can read from there. I think we can use this as a basline as well
+- request queuing, token-aware load and flow control are out of scope for this prototype"
+- also, chat templates is out of scope for this demo
 
 ```
 GPUs	2x NVIDIA RTX 5060 Ti, 16 GB each (31.9 GB total)
@@ -55,6 +57,8 @@ B's log lines for step 4:
 ```
 
 ### Limitations/Caveats/General thots
+
+- current load balancer only runs on linux x86 64. we can probably add support later on for others because its only an issue of the tokeniser liberary. TODO: read architecture and change env var respectively
 
 - Current version of the code doesnt pin any slots. So theoretically, the pages in A could be ovewritten. Pin in actual design
 - B's own pages are also published to A (23 pages, from `Q`), since both servers run the same backend. (this is okay for different prompts, but for the same hashes, we shpuld not publish, only have B publish the newly computed prefill values)
@@ -129,6 +133,84 @@ Also, add a timeout on the pin, and also on the communication between A and B in
 
 ### the sg lang design
 - start with `interface_v1: 1`, `--kv-events-config '{"publisher": "zmq", "topic": "kv-events"}'`, `--hicache-write-policy write_through`,  `--mem-fraction-static`, `--hicache-ratio` or `--hicache-size`
+- `--kv-events-config '{"publisher":"zmq","endpoint":"tcp://*:5557","topic":"","replay_endpoint":"tcp://*:5558","format":"default"}'` for the zmq socket, publishing kv cache.
+
+```
+┌─────────────────┬────────────────┬───────────────────────────────────────────────────┐
+│      field      │    default     │                      meaning                      │
+├─────────────────┼────────────────┼───────────────────────────────────────────────────┤
+│ publisher       │ "null"         │ "zmq" to enable, "null" is a no-op                │
+├─────────────────┼────────────────┼───────────────────────────────────────────────────┤
+│ endpoint        │ "tcp://*:5557" │ PUB socket; * = bind-all, concrete host = connect │
+├─────────────────┼────────────────┼───────────────────────────────────────────────────┤
+│ bind            │ null (auto)    │ override bind vs connect                          │
+├─────────────────┼────────────────┼───────────────────────────────────────────────────┤
+│ replay_endpoint │ null           │ optional ROUTER socket for missed-batch replay    │
+├─────────────────┼────────────────┼───────────────────────────────────────────────────┤
+│ buffer_steps    │ 10 000         │ how many past batches to buffer for replay        │
+├─────────────────┼────────────────┼───────────────────────────────────────────────────┤
+│ hwm             │ 100 000        │ ZMQ high-water-mark before drops                  │
+├─────────────────┼────────────────┼───────────────────────────────────────────────────┤
+│ max_queue_size  │ 100 000        │ internal Python queue before drops                │
+├─────────────────┼────────────────┼───────────────────────────────────────────────────┤
+│ topic           │ ""             │ ZMQ topic prefix                                  │
+├─────────────────┼────────────────┼───────────────────────────────────────────────────┤
+│ format          │ "default"      │ "dynamo" for NVIDIA Dynamo-compatible format      │
+└─────────────────┴────────────────┴───────────────────────────────────────────────────┘
+```
+
+```
+Wire framing (every message is three ZMQ frames):
+
+[topic_bytes] [seq: 8-byte big-endian int64] [msgpack payload]
+
+The payload is a msgpack-encoded KVEventBatch which decodes as a positional array: [ts, events, attn_dp_rank].
+
+Event types — events is a list of tagged msgpack maps, each with a type key:
+
+BlockStored
+
+{
+  "type": "BlockStored",
+  "block_hashes": [int, ...],       # list of int64 hashes
+  "parent_block_hash": int | None,  # hash of the preceding block
+  "token_ids": [int, ...],          # actual token IDs that fill this block
+  "block_size": int,                # tokens per block
+  "lora_id": int | None,
+  "medium": "GPU" | "CPU_PINNED" | "DISK" | "EXTERNAL" | None,
+  "cache_salt": str | None,
+  "session_id": str | None,
+  "lora_name": str | None,          # only in "dynamo" format
+}
+
+BlockRemoved
+
+{
+  "type": "BlockRemoved",
+  "block_hashes": [int, ...],
+  "medium": "GPU" | "CPU_PINNED" | ... | None,
+}
+
+AllBlocksCleared
+
+{"type": "AllBlocksCleared"}
+
+```
+okay so these people have a design which eugh
+
+when moving from L1->L2 we get 2 events
+1. BlockRemoved with medium="GPU" // its goine from GPU
+2. BlockStored with medium="CPU_PINNED" // its now on host
+
+when L2->L1 back
+1. BlockStored with medium="GPU" // it's back on GPU
+2. (The CPU copy may then emit BlockRemoved with medium="CPU_PINNED" when reclaimed) // they only do this if CPU runs out of its max capacity???
+
+so we cant rely on these events as a whole, we need to track GPU and CPU states independantly and on each request, use a styate machine to figure out where the state of shit is
+use transactions when writing double event events (like the ones above)
+since we are using write_through, we should see write to GPU and later on see a write to CPU event
+
+NOTE: also keep in mind, the actual kv cache doesnt use any hashing. it searches by tokens only. KEEP THAT IN MIND
 
 ### comparison
 compare against SGLangs L3 cache sharing. that would be fun
