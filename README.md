@@ -59,7 +59,6 @@ B's log lines for step 4:
 - Current version of the code doesnt pin any slots. So theoretically, the pages in A could be ovewritten. Pin in actual design
 - B's own pages are also published to A (23 pages, from `Q`), since both servers run the same backend. (this is okay for different prompts, but for the same hashes, we shpuld not publish, only have B publish the newly computed prefill values)
 - Ran a small as fuck model, so quality isnt something that was tested 
-- Cache invalidatio is out of scope for now
 - This was only a test to see if transfer over NIXL, assisted with SQLangs Autocache is evern possible, therefore the 327.5ms time over a local network is not to be taken at face value
 - It is probably not a good idea to publish from GPU to CPU on every request, it hinders GPUs performace and is a huge bottleneck, maybe we can do smth about this? because currently what we are doing is regardless of if we will need to transfer the cache, Autocache pushes the cache into L2 (CPU) (granted, it doesnt does it by pages and doesnt push cache existing in L2 redundantly). We use this flag for this `--hicache-write-policy write_through`. Other options for this flag are `write_back` and `write_through_selective`. `write_through_selective`. This guys only copies onto L2 if its a hotspot. Not sure if we can use this for our case tbh and `write_back` only writes upon eviction so nah. If we could find a way to pull to L2 lazily (on demand) that would be great otherwise this seems a bit eek.
 
@@ -97,3 +96,53 @@ Note: I think we can also use this as one of the baselines for comparison. Dynam
 ### Launch commands
 in launch.sh
 args are name, gpu, port, peer
+
+### alr for the actual load balancer
+components
+- route table (this will need to have {hash, [node_ips]})
+We are gonna keep this as a in memory thing i aint doing allat
+
+- the heartbeat moniter (i wonder if there is an existing library taht takes care of the boilr plate code for me, this stuff is pretty standard)
+okay there is Gin Proxy but knowing Gin, NUH HUH
+eh ukw we can write it ourselves
+i think i can just have the agent expose a /health endpoint
+and i think we should also store this information in memory
+
+- the cache evictor (subscribes to the nodes' ZMQ sockets)
+
+- the tokeniser and hasher (ts needs to be lightweight) to tokenise and hash incoming requests (NOTE: make sure the hashers used are uniform throughout)
+
+- the actual routing logic (this will be caliberated to the results of "break point on prefill length where trasnfer becoumes cheaper than recomputation (altough, my results will be driven my a model and will heavily depend on the model size but what are you gonna do))
+user req -> tokenise -> hash prefix wise based on SGLangs block size (64 i think?), if the any hash doesnt exist, send to the best node (i think just round robin for this or last used?) -> if hashes do exist, match largest prefix hash to the node ip -> if node is chilling (have this thershold be configurable), send it to her -> if the node is not chilling, find one that is chilling -> send to him with headers {hash, producer_ip, block_id} and such -> the agent then takes care of the rest
+
+also, the route table is updated in background as its subscribed to the event. the agent need not return new hashes along with its response
+
+- also, if we have cache hits on multiple nodes, load is the tie breaker
+
+
+### the general agent design
+we have a general agent design working currently. Need to add a few things on top of it
+- the /health endpoint (have it report current load plus queued shit)
+- mechanism to pin the pages in the CPU while they are being read  (NOTE: check how we can do this, because if we cant, a missing or overwritten page needs to be recoumted by B)
+Also, add a timeout on the pin, and also on the communication between A and B in general. If it surpasses, have B recompute (current test waits for the computer, we should add a timeout)
+- when a pull fails, we broadcast and remove hash from route table. i dont know how reliable ZMQ's socket is, its TCP so its SHOULD be fine
+
+### the sg lang design
+- start with `interface_v1: 1`, `--kv-events-config '{"publisher": "zmq", "topic": "kv-events"}'`, `--hicache-write-policy write_through`,  `--mem-fraction-static`, `--hicache-ratio` or `--hicache-size`
+
+### comparison
+compare against SGLangs L3 cache sharing. that would be fun
+maybe we can compare against llm-d(we should def do this one, its a very similar design but for vLLM) and a dedicated kv aware scheduling algo (like what was is called cacheroute or smth)
+im not a 100% sure on how nvidias Dynamo framework works, but from what i understand, it does a similar routing logic. but the thing is, idek if this method is like worth it all in the first place guys. like, this might just absolutely tank on latency
+
+I think we should do a test for the "break point between latency and recomputation for prefix lengths" experiment first
+what does llm-d do? it mush have a similar mechanism
+okay so, they have a script that caliberates this shit for ur model, GPU and transport which is neat. we will not be doing that for this run :sob:
+But since they have it caliberated dynamically, the experimental comparison should be fair.
+
+obv we wont be able to make this super sophisticated to survive actual production workloads, but this is just a proof and not a prod ready software
+
+- i think we should make the offilne shit first
+- and have a startup script i can just run to save on costs
+- once we get out agent and proxy working, we can carry out the experiment to get the sweet number. will also need more CPU ram so i can use a larger model
+(like 100B+ lets see)
