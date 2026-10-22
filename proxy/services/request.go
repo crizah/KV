@@ -1,17 +1,21 @@
 package services
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"proxy/services/router"
 
 	"github.com/daulet/tokenizers"
 )
 
 type RequestService struct {
-	model    Model
-	input    string
-	pageSize int
+	model      Model
+	input      string
+	pageSize   int
+	routeTable *router.RouteTable
+	tokeniser  *tokenizers.Tokenizer
 }
 
 type Model string
@@ -20,12 +24,17 @@ const (
 	QWEN306B Model = "Qwen3-0.6B"
 )
 
-func NewRequestService(model Model, input string) (*RequestService, error) {
+func NewRequestService(model Model, input string, table *router.RouteTable) (*RequestService, error) {
 	// TODO: 16 is a default. MAKE SURE THE SERVER AND PROXY USE THE SAME NUMBER FOR THIS
-	return &RequestService{model: model, input: input, pageSize: 16}, nil
+	path := fmt.Sprintf("../configs/%s/tokenizer_config.json", req.model)
+	tk, err := tokenizers.FromFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return &RequestService{model: model, input: input, pageSize: 16, routeTable: table, tokeniser: tk}, nil
 }
 
-func (req *RequestService) HandleReq() error {
+func (req *RequestService) HandleReq(ctx context.Context) error {
 	// tokenise her
 	encoded, err := req.tokenise()
 	if err != nil {
@@ -33,17 +42,12 @@ func (req *RequestService) HandleReq() error {
 	}
 
 	// hash her ain a chain until we hit a cache miss
-	N, err := req.hasher(encoded, nil)
+	N, err := req.hasher(ctx, encoded, nil)
 	if err != nil {
 		return fmt.Errorf("handleReq error %s", err.Error)
 	}
 	// at this point N should never be null right?
-	node, b := req.router(N)
-	if !b {
-		// we send with headers
-	} else {
-		// we send
-	}
+	node := req.router(ctx, N)
 
 }
 
@@ -53,7 +57,7 @@ type routerRes struct {
 	metaData []string // the metadat needed to send with a pull req
 }
 
-func (req *RequestService) router(R *hasherRes) *routerRes {
+func (req *RequestService) router(ctx context.Context, R *hasherRes) *routerRes {
 	// TODO: this function waits for the goroutine thats going to deliver us the list of healthy nodes
 
 	if R.exists {
@@ -63,40 +67,25 @@ func (req *RequestService) router(R *hasherRes) *routerRes {
 	} else {
 		// itarate over the available nodes and find the best one to choose from
 	}
-
 }
 
 func (req *RequestService) tokenise() ([]uint32, error) {
 	// i dont think the tokeniser depends on order
 	// so should e use gorutines here for a very large prompt?
 	// because goroutines can be overkill just because of the setup
-	path := fmt.Sprintf("../configs/%s/tokenizer_config.json", req.model)
+	// TODO: move this tokeniser intialissation to startup
 
-	tk, err := tokenizers.FromFile(path)
-	if err != nil {
-		return nil, err
-	}
-	defer tk.Close()
-	encoded, _ := tk.Encode(req.input, true) // SGLang sets this as true, we want to replicate
+	defer req.tokeniser.Close()
+	encoded, _ := req.tokeniser.Encode(req.input, true) // SGLang sets this as true, we want to replicate
 	return encoded, nil
-
 }
 
 type hasherRes struct {
 	exists bool
-	nodes  []string
+	nodes  map[string]struct{}
 }
 
-func (req *RequestService) checkCache(hash int64) ([]string, error) {
-	// checks the route tables for this hash and returns the ips of the nodes if it exists
-	// this is where we will need to check for both CPU and GPU tables
-	// if it doesnt exist in CPU, girl its gone (since we also write in transactions)
-
-	// oh i think we only need tp check if it exists in CPU or not. so yes, do that
-	// // also move this to a router service along with other router related shit. this guy needs to be built before handler registrations
-}
-
-func (req *RequestService) hasher(tokens []uint32, priorDigest []byte) (*hasherRes, error) {
+func (req *RequestService) hasher(ctx context.Context, tokens []uint32, priorDigest []byte) (*hasherRes, error) {
 	// int(SHA256(parent_digest + tokens)[:16], 16) reinterpreted as int64
 	// NOTE: pageSize defaults to 16, set is as that and make sure its the same on both server and proxy. maybe we can have an event
 	// at startup that gives us this
@@ -112,7 +101,7 @@ func (req *RequestService) hasher(tokens []uint32, priorDigest []byte) (*hasherR
 
 	digest := priorDigest
 	flag := false
-	var N []string
+	N := make(map[string]struct{})
 
 	for p := 0; p < numPages; p++ {
 		page := tokens[p*req.pageSize : (p+1)*req.pageSize]
@@ -124,10 +113,8 @@ func (req *RequestService) hasher(tokens []uint32, priorDigest []byte) (*hasherR
 		//search if this is a miss right here, if it is, we wont find anything further so stop
 		// only continue if we get a cache hit
 
-		nodes, err := req.checkCache(bigInd)
-		if err != nil {
-			return nil, fmt.Errorf("error checking for cache in table %s", err.Error)
-		}
+		nodes := req.routeTable.ReadCache(ctx, bigInd)
+
 		if len(nodes) == 0 {
 			// we didnt find any servers that have this guy for this digest
 			if !flag {

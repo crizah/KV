@@ -127,6 +127,9 @@ also, the route table is updated in background as its subscribed to the event. t
 ### the general agent design
 we have a general agent design working currently. Need to add a few things on top of it
 - the /health endpoint (have it report current load plus queued shit)
+
+we d0onmt need a dedicated endpoint. see sg lang design below
+
 - mechanism to pin the pages in the CPU while they are being read  (NOTE: check how we can do this, because if we cant, a missing or overwritten page needs to be recoumted by B)
 Also, add a timeout on the pin, and also on the communication between A and B in general. If it surpasses, have B recompute (current test waits for the computer, we should add a timeout)
 - when a pull fails, we broadcast and remove hash from route table. i dont know how reliable ZMQ's socket is, its TCP so its SHOULD be fine
@@ -211,6 +214,13 @@ use transactions when writing double event events (like the ones above)
 since we are using write_through, we should see write to GPU and later on see a write to CPU event
 
 NOTE: also keep in mind, the actual kv cache doesnt use any hashing. it searches by tokens only. KEEP THAT IN MIND
+
+
+- `-load-publish-endpoint tcp://*:6000` for health pretty much
+[b"load"] [seq 8B big-endian] [msgpack LoadStat]. The LoadStat payload is a positional array:
+["LoadStat", num_running_reqs, num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank, ...]
+
+Requires `--kv-events-config` to be set with a TCP endpoint
 
 ### comparison
 compare against SGLangs L3 cache sharing. that would be fun
