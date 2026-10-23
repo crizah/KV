@@ -1,4 +1,4 @@
-module proxy
+module github.com/crizah/KV/proxy
 
 go 1.23.1
 

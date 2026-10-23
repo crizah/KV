@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"maps"
 	"reflect"
 	"sync"
@@ -13,26 +14,39 @@ import (
 )
 
 type RouteTable struct {
-	mx             sync.RWMutex
-	routeMapCPU    map[int64]map[string]struct{} // maps hash to an array of nodes in CPU
-	routeMapGPU    map[int64]map[string]struct{} // in GPU
-	endpoint       string                        // endpoint to listen to for kv cache
-	replayEndpoint string                        // endpoint to listen to for replay of dropped caches
-	nodes          []string                      // array of nodes that exist, registered at startup
+	routeMapCPU    *cpuMap
+	routeMapGPU    *gpuMap
+	endpoint       string   // endpoint to listen to for kv cache
+	replayEndpoint string   // endpoint to listen to for replay of dropped caches
+	nodes          []string // array of nodes that exist, registered at startup
+	// seqMap         *seqMap // i think a lock on thsi table is overkill, its being read sequentially
+	seqMap map[string]uint64 // tracks the last seen seq kv event per node
+}
+
+type cpuMap struct {
+	mx    sync.RWMutex
+	table map[int64]map[string]struct{} // maps hash to an array of nodes in CPU
+}
+
+type gpuMap struct {
+	mx    sync.RWMutex
+	table map[int64]map[string]struct{} // maps hash to an array of nodes in GPU
 }
 
 func NewRouteTableService(endpoint string, replayEndpoint string, nodes []string) *RouteTable {
 	c := make(map[int64]map[string]struct{})
 	g := make(map[int64]map[string]struct{})
-	return &RouteTable{routeMapCPU: c, routeMapGPU: g,
-		endpoint: endpoint, replayEndpoint: replayEndpoint, nodes: nodes}
+	seq := make(map[string]uint64)
+	for _, n := range nodes {
+		seq[n] = 0 // start the seq map with 0
+	}
+	return &RouteTable{routeMapCPU: &cpuMap{table: c},
+		routeMapGPU: &gpuMap{table: g}, endpoint: endpoint, replayEndpoint: replayEndpoint,
+		nodes: nodes, seqMap: seq}
 }
 
 func (table *RouteTable) writeCache(events *KVEventBatch) {
-	table.mx.Lock()
-	defer table.mx.Unlock()
 	// idk what to do with the other params in this batch res
-	// TODO: keep track of seq to find out if we dropped an event, if we did, listen for those through the replayEndpoint
 	for _, event := range events.events {
 		switch event.Type {
 		case "BlockStored":
@@ -69,12 +83,16 @@ func (table *RouteTable) writeCache(events *KVEventBatch) {
 
 			switch medium {
 			case "GPU":
+				table.routeMapGPU.mx.Lock()
+				defer table.routeMapGPU.mx.Unlock()
 				for _, hash := range hashes {
-					table.routeMapGPU[hash][events.nodeIP] = struct{}{}
+					table.routeMapGPU.table[hash][events.nodeIP] = struct{}{}
 				}
 			case "CPU_PINNED":
+				table.routeMapCPU.mx.Lock()
+				defer table.routeMapCPU.mx.Unlock()
 				for _, hash := range hashes {
-					table.routeMapCPU[hash][events.nodeIP] = struct{}{}
+					table.routeMapCPU.table[hash][events.nodeIP] = struct{}{}
 				}
 			default:
 				// nuh huh, we dont need to do anything i think
@@ -97,12 +115,16 @@ func (table *RouteTable) writeCache(events *KVEventBatch) {
 			}
 			switch medium {
 			case "GPU":
+				table.routeMapGPU.mx.Lock()
+				defer table.routeMapGPU.mx.Unlock()
 				for _, hash := range hashes {
-					delete(table.routeMapGPU[hash], events.nodeIP)
+					delete(table.routeMapGPU.table[hash], events.nodeIP)
 				}
 			case "CPU_PINNED":
+				table.routeMapCPU.mx.Lock()
+				defer table.routeMapCPU.mx.Unlock()
 				for _, hash := range hashes {
-					delete(table.routeMapCPU[hash], events.nodeIP)
+					delete(table.routeMapCPU.table[hash], events.nodeIP)
 				}
 			default:
 				// nuh huh
@@ -112,11 +134,17 @@ func (table *RouteTable) writeCache(events *KVEventBatch) {
 		default:
 			// 	{"type": "AllBlocksCleared"}
 			// remove from both tables
-			for h, _ := range table.routeMapCPU {
-				delete(table.routeMapCPU[h], events.nodeIP)
+			table.routeMapCPU.mx.Lock()
+			defer table.routeMapGPU.mx.Unlock()
+
+			table.routeMapGPU.mx.Lock()
+			defer table.routeMapGPU.mx.Unlock()
+
+			for h, _ := range table.routeMapCPU.table {
+				delete(table.routeMapCPU.table[h], events.nodeIP)
 			}
-			for h, _ := range table.routeMapGPU {
-				delete(table.routeMapCPU[h], events.nodeIP)
+			for h, _ := range table.routeMapGPU.table {
+				delete(table.routeMapCPU.table[h], events.nodeIP)
 			}
 		}
 	}
@@ -127,11 +155,22 @@ func (table *RouteTable) ReadCache(ctx context.Context, hash int64) map[string]s
 	// reads the cache for this hash and returns the []string of a nodes if it exists in the table
 	// check both GPU and CPU but i thinkwe are adding events in batches so only cpu should be fine?
 	// if an event does have both gpu and cpu, are we not addint it in one lock?
-	table.mx.RLock()
-	defer table.mx.RUnlock()
-	node, ok := table.routeMapCPU[hash]
+	// no we are not. whelp, read from both
+
+	// hehe guys what if we did a goroutine, first res wins, cancel context, buffered channel design for 2 O(1) lookups
+
+	table.routeMapCPU.mx.RLock()
+	var node map[string]struct{}
+	node, ok := table.routeMapCPU.table[hash]
+	table.routeMapCPU.mx.RUnlock()
 	if !ok {
-		return nil
+		// check the GPU
+		table.routeMapGPU.mx.RLock()
+		node, ok = table.routeMapGPU.table[hash]
+		table.routeMapGPU.mx.RUnlock()
+		if !ok {
+			return nil
+		}
 	}
 	// return a copy here since we dont need to modify it anymore
 	n := maps.Clone(node)
@@ -156,7 +195,7 @@ type KVEventBatch struct {
 func (table *RouteTable) Listen(ctx context.Context) {
 	// keep one channel that all the listeners write to
 	// and one routine that reads from the channel
-	ch := make(chan *KVEventBatch, 1024)
+	ch := make(chan *KVEventBatch, 1024) // NOTE: idk about this exact buffer size
 
 	for _, n := range table.nodes {
 		// have all of them write to ch
@@ -164,14 +203,28 @@ func (table *RouteTable) Listen(ctx context.Context) {
 		go listenNode(ctx, nodeIP, n, ch)
 	}
 
-	// idk guys should the listener be before we start spinning up the routines? probaby right?
 	select {
 	case event := <-ch:
 		if event.error != nil {
-			// retry this guy here
-
+			// TODO: retry this guy here
+			// but for now, log
+			slog.Error("KMQ event failed", "nodeIP", event.nodeIP, "error", event.error.Error())
 		} else {
 			// write sequentially because we have a lock anyways
+			// TODO: keep track of seq to find out if we dropped an event, if we did, listen for those through the replayEndpoint
+			prevSeq := table.seqMap[event.nodeIP]
+			if prevSeq == 0 {
+				// this is our first event for this node
+				prevSeq = event.seq
+			} else {
+				if event.seq != prevSeq+1 {
+					// we need to read for this in our replay channel
+					// TODO: do that
+					// but for now, log
+					slog.Info("KMQ event missed", "nodeIP:", event.nodeIP, "missed event:", prevSeq+1)
+				}
+				table.seqMap[event.nodeIP] = event.seq
+			}
 			table.writeCache(event)
 		}
 	case <-ctx.Done():
